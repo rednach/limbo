@@ -1,24 +1,10 @@
+import os
 import sys
 import time
+import re
 
 from mk_livestatus import Socket
-
-ANSIBLE_COLOR=True
-if not hasattr(sys.stdout, 'isatty') or not sys.stdout.isatty():
-    ANSIBLE_COLOR=False
-else:
-    try:
-        import curses
-        curses.setupterm()
-        if curses.tigetnum('colors') < 0:
-            ANSIBLE_COLOR=False
-    except ImportError:
-        # curses library was not found
-        pass
-    except curses.error:
-        # curses returns an error (e.g. could not find terminal)
-        ANSIBLE_COLOR=False
-
+from slacker import Slacker
 
 class HostService(object):
     STATE2STRING = {}
@@ -38,7 +24,7 @@ class Host(HostService):
     STATE2STRING = {0: 'UP', 1: 'DOWN'}
 
     def init(self):
-    	super(self.__class__, self).init()
+        super(self.__class__, self).init()
         self.host_name = self.name
         self.service = ''
 
@@ -47,71 +33,14 @@ class Service(HostService):
     STATE2STRING = {0: 'OK', 1: 'WARNING', 2: 'CRITICAL', 3: 'UNKNOWN'}
 
     def init(self):
-    	super(self.__class__, self).init()
+        super(self.__class__, self).init()
         self.host_name = self.host_name
-        self.service = ''
+        self.service = self.description
 
 
-# --- begin "pretty"
-#
-# pretty - A miniature library that provides a Python print and stdout
-# wrapper that makes colored terminal text easier to use (eg. without
-# having to mess around with ANSI escape sequences). This code is public
-# domain - there is no license except that you must leave this header.
-#
-# Copyright (C) 2008 Brian Nez <thedude at bri1 dot com>
-#
-# http://nezzen.net/2008/06/23/colored-text-in-python-using-ansi-escape-sequences/
-
-codeCodes = {
-    'black':     '0;30', 'bright gray':    '0;37',
-    'blue':      '0;34', 'white':          '1;37',
-    'green':     '0;32', 'bright blue':    '1;34',
-    'cyan':      '0;36', 'bright green':   '1;32',
-    'red':       '0;31', 'bright cyan':    '1;36',
-    'purple':    '0;35', 'bright red':     '1;31',
-    'yellow':    '0;33', 'bright purple':  '1;35',
-    'dark gray': '1;30', 'bright yellow':  '1;33',
-    'normal':    '0'
-}
-
-def stringc(text, color):
-    """String in color."""
-
-    if ANSIBLE_COLOR:
-        return "\033["+codeCodes[color]+"m"+text+"\033[0m"
-    else:
-        return text
-
-# --- end "pretty"
-
-
-format_parameters = dict(
-    width_aleascope_name=38,
-    width_ip = 16,
-    width_type = 15,
-    width_model = 13,
-
-    width_name=16,
-    width_output=60,
-    width_duration=17,
-    width_header=18,
-    state2color = {1:'yellow', 2:'red', 3:'blue'},
-)
-
-HOSTCOLUMNS = ('name', 'state', 
-    'last_check', 'next_check', 
-    'acknowledged', 
-    'plugin_output', 
-    'source_problems', 
-    'is_impact', 'is_flapping', 'is_problem', 
-    'scheduled_downtime_depth', 
-    'downtimes', 'comments', 'business_impact', 
-    'scheduled_downtime_depth', 'num_services_crit', 
-    'num_services_warn', 'num_services_unknown', 'num_services_ok', 
-    'has_been_checked', 'got_business_rule', 'hard_state', 'initial_state')
-
+HOSTCOLUMNS = ('name', 'state', 'last_check', 'next_check', 'acknowledged', 'plugin_output', 'source_problems', 'is_impact', 'is_flapping', 'is_problem', 'scheduled_downtime_depth', 'downtimes', 'comments', 'business_impact', 'scheduled_downtime_depth', 'num_services_crit', 'num_services_warn', 'num_services_unknown', 'num_services_ok', 'has_been_checked', 'got_business_rule', 'hard_state', 'initial_state')
 SERVICECOLUMNS = ('host_name', 'description', 'state', 'last_check', 'next_check', 'acknowledged', 'plugin_output', 'source_problems', 'is_impact', 'is_flapping', 'is_problem', 'scheduled_downtime_depth', 'downtimes', 'comments', 'business_impact')
+
 
 def print_duration(t, just_duration=False, x_elts=0):
     if t == 0 or t == None:
@@ -186,44 +115,82 @@ def print_duration(t, just_duration=False, x_elts=0):
 
 def on_message(msg, server):
     text = msg.get("text", "")
+    print 'text', text
 
-    s = Socket(('ses', 42000))
-    q = s.hosts.columns(*HOSTCOLUMNS).filter('state != 0')
-    format_sting = ''
-    for p in q.call():
-        h = Host(**p)
-        format_sting += _print_item(h) + '\n'
+    match = re.findall(r"!(?:problems|pbl) (.*)", text)
+    if not match:
+        return
 
-    q = s.services.columns(*SERVICECOLUMNS).filter('state != 0')
-    for p in q.call():
-        s = Service(**p)
-        format_sting += _print_item(h) + '\n'
+    channel = msg.get("channel", "")
+    user = msg.get("user", "")
+    sufix = match[0]
 
-    return str(msg) + '\n\n' + format_sting
+    if not (channel or user):
+        return
+
+    if channel and channel.startswith('C'):
+        slack = _get_slacker()
+        response = slack.channels.list()
+        try:
+            channel_name, = [chn['name'] for chn in response.body['channels'] if chn['id'] == channel]
+        except Exception, exc:
+            for chn in response.body['channels']:
+                if chn['id'] == channel:
+                    print '!!!', channel
+                else:
+                    print '???', chn['id'], channel
+
+            return 'Exception:' + str(exc)+'-'+str(msg)+'-'
+    elif sufix:
+        channel_name = sufix
+    else:
+        return 'for which net?'
+
+    s = Socket(('%s.phicus.es' % channel_name, 4299))
+    try:
+        q = s.hosts.columns(*HOSTCOLUMNS).filter('state != 0')
+        format_sting = ''
+        for p in q.call():
+            format_sting += _slackize(Host(**p)) + '\n'
+
+        format_sting += '\n'
+        q = s.services.columns(*SERVICECOLUMNS).filter('state != 0')
+        for p in q.call():
+            format_sting += _slackize(Service(**p)) + '\n'
+    except Exception, exc:
+        return 'Exception channel_name=%s exc=%s' % (channel_name, str(exc))
+
+    # return str(msg) + '\n\n' + format_sting
+    return format_sting
 
 
-def _print_item(item, show_plugin_output_if_ok=True):
+def _get_slacker():
+    return Slacker(os.environ.get('SLACK_TOKEN'))
+
+
+def _slackize(item):
+    servicestate2icon = {
+        "UP": ":white_check_mark:",
+        "DOWN": ":exclamation:",
+
+        "CRITICAL": ":exclamation:",
+        "WARNING": ":warning:",
+        "OK": ":white_check_mark:",
+        "UNKNOWN": ":question:",
+    }
+    icon = servicestate2icon.get(item.state, ':white_medium_square:')
     show_extra_fields = item.state or show_plugin_output_if_ok
-    string = '{}{}{}{} {:{left_align}{width_name}} {:{left_align}{width_name}} {:>{width_output}.{width_output}} {:>{width_duration}} {:>{width_duration}} '.format(
-        'v' if item.acknowledged else ' ',
-        'f' if item.is_flapping else ' ',
-        'p' if item.is_problem else ' ',
-        'i' if item.is_impact else ' ',
+    string = '{} {} {} {} {} {} {} '.format(
+        icon,
         item.host_name,
         item.service,
-        item.plugin_output if show_extra_fields else '',
+        item.state,
+        item.plugin_output,
         print_duration(item.last_check) if show_extra_fields else '',
         print_duration(item.next_check) if show_extra_fields else '',
-        left_align='<' if 'ost' in str(item.__class__) else '>',
-        width_name=format_parameters['width_name'],
-        width_output=format_parameters['width_output'],
-        width_duration=format_parameters['width_duration'],
         )
     return string
-    # return stringc(string, color=format_parameters['state2color'].get(item.state_id, 'normal'))
-
 
 if __name__ == '__main__':
-    # ret = on_message({}, None)
-    # print ret
-    pass
+    ret = on_message({u'channel': u'C0BJR8H53', u'text': u'!pbl ses'}, None)
+    print ret
